@@ -1,0 +1,23 @@
+# Environments
+.env
+.env.local
+.env.server
+.venv/
+__pycache__/
+*.pyc
+
+# Data and artifacts (server-only, never in git)
+data/
+artifacts/
+
+# Notebook outputs
+.ipynb_checkpoints/
+*.ipynb_meta
+
+# Editor
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
