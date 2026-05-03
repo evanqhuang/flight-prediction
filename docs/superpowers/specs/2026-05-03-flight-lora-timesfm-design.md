@@ -14,10 +14,11 @@ The `unfare` system scrapes flight prices into a TimescaleDB hypertable (`flight
 ## Data overview (as of 2026-05-03)
 
 - **Rows:** 55.97M in `flight_prices`, 3-month coverage (2026-02-03 → 2026-05-03).
-- **Routes:** 246 actively scraped (of 406 total active in `routes`).
+- **Routes:** 246 actively scraped (of 406 total active in `routes`); all are domestic (`is_international=0`).
 - **Forward booking horizon:** ~75 days (departures up to 2026-07-19).
 - **Per-(route, departure) cadence:** 400–1000 snapshots per week, covering ~42–46 distinct hours → effectively hourly.
 - **Storage:** TimescaleDB hypertable; chunked by `scraped_at`.
+- **Currency:** All prices assumed USD (consistent with all-domestic route set). To be verified before training.
 
 ## Decisions
 
@@ -28,10 +29,10 @@ The `unfare` system scrapes flight prices into a TimescaleDB hypertable (`flight
 | Resampling cadence | Hourly | Preserves intraday volatility / drop signal |
 | Forecast horizon | 168 hours (7 days) | Window where buy/wait has a meaningful answer |
 | Hardware | Single 24GB consumer GPU | Sufficient for LoRA on TimesFM-2.5-200M |
-| Covariates | `days_to_departure`, `day_of_week` | Known causal drivers, fully knowable into the future |
+| Covariates | **None in v1** (univariate only); XReg overlay deferred to v1.5 | TimesFM-2.5 has no covariate-aware training path; see Risks |
 | Deployment | Research → batch scorer (no real-time API in v1) | Don't build serving until model proves out |
 | Success criteria | Forecast metrics + decision metrics, both gated | Vibes-free promotion criteria |
-| LoRA strategy | Single global adapter, staged training | Cheap-to-debug, attribution per stage |
+| LoRA strategy | Single global adapter, baseline-gated training | Cheap-to-debug; one zero-shot baseline + one LoRA training run |
 | Code/runtime split | Code on Mac, synced via Mutagen, training on server | Best dev UX without shipping data over the network |
 | Price normalization | Log-transform during preprocessing | Equal gradient contribution across fare scales |
 
@@ -46,18 +47,17 @@ flight-prediction/
 ├── src/flight_lora/
 │   ├── db.py                  # Postgres reader (read-only, parameterized)
 │   ├── dataset.py             # raw rows → log-transformed hourly series + splits
-│   ├── covariates.py          # builds days_to_departure, day_of_week aligned to series
-│   ├── train.py               # the staged training runs
+│   ├── train.py               # baseline + LoRA training runs
 │   ├── eval.py                # forecast + decision-quality metrics
-│   └── infer.py               # batch scorer (v2)
+│   └── infer.py               # inference library: load adapter, score series (used by v2)
 ├── notebooks/                 # exploration, sanity checks, eval plots
 ├── scripts/
 │   ├── build_dataset.py       # one-shot: pull from db → write parquet
-│   ├── run_stage.py           # CLI: --stage zero_shot|lora_uni|lora_cov
+│   ├── run_stage.py           # CLI: --stage zero_shot|lora_uni|xreg_eval
 │   ├── run_batch_scorer.py    # v2 batch inference
 │   └── remote_train.sh        # ssh + tmux wrapper around run_stage.py
 ├── tests/                     # unit tests
-├── Makefile                   # train-uni, train-cov, pull-artifacts, etc.
+├── Makefile                   # baseline, train-uni, eval-xreg, pull-artifacts, etc.
 ├── .env.local                 # DB_HOST=192.168.93.107  (Mac side)
 ├── .env.server                # DB_HOST=localhost        (server side, mutagen-excluded)
 ├── .mutagen.yml               # sync config
@@ -68,10 +68,10 @@ flight-prediction/
 **Module boundaries:**
 
 - **`db.py`** — given a config + window, returns a DataFrame of raw `flight_prices` rows. Postgres is its only dependency; trivially mockable.
-- **`dataset.py`** — pure transform from raw rows to (context, target, covariates) tensors at a regular hourly grid. Owns the route-level train/val/test split. Applies `log(price)` before yielding.
-- **`covariates.py`** — pure function: given a series, emits aligned `days_to_departure` and `day_of_week` arrays of length `context + horizon`.
+- **`dataset.py`** — pure transform from raw rows to `(context, target)` tensors at a regular hourly grid. Owns the route-level train/val/test split. Applies `log(price)` before yielding.
 - **`train.py`** — given a stage config, loads model + LoRA, trains, saves adapter. Knows nothing about the DB.
 - **`eval.py`** — given predictions and ground truth, computes forecast metrics in dollar-space (post-`exp`) and decision metrics. Reusable across all stages.
+- **`infer.py`** — given a saved adapter and a series, returns quantile forecasts. Pure inference, no orchestration. Imported by `scripts/run_batch_scorer.py` for the v2 deployment.
 
 **Data flow:**
 
@@ -80,7 +80,7 @@ Postgres → db.py → raw DataFrame
                        ↓
                build_dataset.py → cached parquet (per-series, log-transformed)
                        ↓
-                   dataset.py → (context, target, covariates) tensors
+                   dataset.py → (context, target) tensors
                        ↓
                     train.py → LoRA adapter checkpoint
                        ↓
@@ -95,7 +95,7 @@ Code repo lives on the Mac, mirrored to the server (which holds the DB and GPU) 
 - **Server-only (excluded from Mac):** `data/` (parquet cache), `artifacts/` (checkpoints), `.env.server`, `.venv/`.
 - **Mac-only (excluded from server):** `.env.local`.
 
-Training is invoked with `make train-uni` / `make train-cov`, which `ssh`s to the server, starts (or attaches to) a per-stage tmux session, and runs `scripts/run_stage.py` inside it. The training script knows nothing about being driven remotely. `make pull-artifacts` rsyncs eval reports back to the Mac for inspection.
+Training is invoked with `make baseline` / `make train-uni` (and optional `make eval-xreg`), each of which `ssh`s to the server, starts (or attaches to) a per-stage tmux session, and runs `scripts/run_stage.py` inside it. The training script knows nothing about being driven remotely. `make pull-artifacts` rsyncs eval reports back to the Mac for inspection.
 
 ## Data pipeline
 
@@ -121,11 +121,7 @@ Training is invoked with `make train-uni` / `make train-cov`, which `ssh`s to th
 - TimesFM's built-in `normalize_inputs=True` runs additionally for per-context-window standardization.
 - Forecasts are `exp`-transformed back to dollar-space before computing reportable metrics and decision thresholds.
 
-**Covariate alignment** (`covariates.py`):
-
-- `days_to_departure` — float, dynamic numerical, decreases monotonically over the series, defined for `context + horizon` steps.
-- `day_of_week` — int 0–6, dynamic categorical, defined for `context + horizon` steps.
-- Both are calendar-derivable, so they are knowable into the forecast horizon — exactly what `forecast_with_covariates` requires.
+**Covariates:** None in v1. TimesFM-2.5 provides no covariate-aware fine-tuning path — see Risks. The model is expected to implicitly capture weekly seasonality (168-hour periodicity is regular in the data) and proximity-to-departure (every series ends at the departure timestamp, so position-from-end encodes it). XReg-style overlay is deferred to v1.5; see "Future work."
 
 **Splits:**
 
@@ -143,36 +139,36 @@ Training is invoked with `make train-uni` / `make train-cov`, which `ssh`s to th
 - `scripts/build_dataset.py` runs once on the server → writes `data/series.parquet` (one row per series with the hourly array + metadata) and `data/splits.json` (route_id → split label).
 - Idempotent given a `--cutoff` timestamp. ~hundreds of MB on disk; loadable into RAM.
 
-## Training (staged)
+## Training (baseline + LoRA)
 
-Three sequential runs, each gated on the previous. All use `google/timesfm-2.5-200m-pytorch` as the base. All log to `artifacts/runs/<stage>/`.
+Two sequential runs, gated. All use `google/timesfm-2.5-200m-pytorch` as the base. All log to `artifacts/runs/<stage>/`. A third optional inference-time evaluation (Stage 1.5) is described after.
 
 **Stage 0 — Zero-shot baseline (no training):**
 
 - Load base TimesFM, run inference on val and test sets.
 - Records: per-series MAPE/SMAPE at 168h horizon, plus naive-last-value and seasonal-naive(24h, 168h) baselines.
-- Output: `artifacts/runs/zero_shot/metrics.json`. No gate — establishes the bar.
+- Output: standard run directory `artifacts/runs/zero_shot/{metrics.json, eval_report.md, summary.json, config.yaml}` (no `adapter/` since nothing is trained). No self-gate — Stage 0 metrics establish the bar that Stage 1's gate references.
 
 **Stage 1 — Univariate LoRA:**
 
-- `TimesFm2_5ModelForPrediction` + `peft.LoraConfig(r=8, lora_alpha=16, target_modules="all-linear", lora_dropout=0.05, bias="none")`.
+- `TimesFm2_5ModelForPrediction` + `peft.LoraConfig(r=8, lora_alpha=16, target_modules="all-linear", lora_dropout=0.05, bias="none")`. Mirrors the official `finetune_lora.py` recipe verbatim apart from data and hyperparameters.
 - ~0.5% of params trainable (~1M params). Fits in 24GB with bf16 and reasonable batch size.
-- Loss: pinball loss against quantile head outputs (q ∈ {0.1, 0.5, 0.9}). Falls back to MSE if quantile head is not used.
-- Optimizer: AdamW, lr 5e-5, cosine schedule, 10 epochs over ~100k sampled windows. Early stop on val SMAPE plateau.
-- **Gate:** test SMAPE ≥15% lower than Stage 0. If not met → halt; investigate.
+- Training forward pass: `model(past_values=context, future_values=target, forecast_context_len=context_len)` — `outputs.loss` is the model's internal loss (verified against current source; we don't compute our own).
+- Optimizer: AdamW, lr 5e-5, cosine schedule, 10 epochs over ~100k sampled windows. Gradient clip at 1.0. Early stop on val SMAPE plateau.
+- **Ship gate:** test SMAPE ≥15% lower than Stage 0 **AND** recall@80%-precision ≥10pp higher than Stage 0. If both met → ship adapter to v2 batch scorer. If not → halt; investigate.
 
-**Stage 2 — LoRA + covariates:**
+**Stage 1.5 — XReg overlay at inference (optional, evaluation only):**
 
-- Same LoRA config. Training uses `forecast_with_covariates` API with `days_to_departure` (dynamic numerical) and `day_of_week` (dynamic categorical).
-- `xreg_mode="xreg + timesfm"` per the official recipe.
-- All other hyperparameters held constant from Stage 1 to isolate the covariate contribution.
-- **Gate:** test SMAPE ≥5% lower than Stage 1 **AND** recall@80%-precision ≥10pp higher than Stage 0. If not met → ship Stage 1 adapter instead.
+- No additional training. After Stage 1 ships, evaluate the adapter again with `forecast_with_covariates(xreg_mode="xreg + timesfm")` passing `days_to_departure` (dynamic numerical) and `day_of_week` (dynamic categorical).
+- XReg here is a per-call sklearn linear regression on the context — it learns no parameters during our training. Adds zero training cost.
+- **Promote-to-deployment gate:** Stage 1.5 metrics must beat Stage 1 metrics by **≥3% SMAPE** on the test set to justify enabling XReg in the batch scorer (XReg adds ~per-series sklearn fit cost and runtime dependency on `scikit-learn`).
+- Limitation: linear-only fit on covariates; nonlinear effects (e.g., V-shaped fare-curve in last 14 days) will not be captured. If Stage 1.5 fails its gate, ship Stage 1 alone.
 
 **Reproducibility/safety:**
 
 - Fixed seeds (numpy, torch, sampler).
-- Each run writes `artifacts/runs/<stage>/{adapter/, metrics.json, config.yaml, train_log.jsonl, eval_report.md, summary.json}`.
-- Config is the only file the training script reads — no hidden CLI overrides. Any run is replayable from its config.
+- Each run writes `artifacts/runs/<stage>/{adapter/, metrics.json, config.yaml, train_log.jsonl, eval_report.md, summary.json}` (no `adapter/` for Stage 0 or Stage 1.5).
+- Config is the only file the training/eval script reads — no hidden CLI overrides. Any run is replayable from its config.
 
 ## Evaluation
 
@@ -186,9 +182,9 @@ Two metric families, both reported.
 
 **Decision metrics** (deployment gate):
 
-- Frame buy/wait as binary classifier: `predicted_min_price_in_next_7d < current_price * (1 - 0.10)` → "wait."
-- Ground truth: actual realized minimum price over the next 7 days.
-- Sweep decision threshold; report the precision-recall curve and the **recall at 80% precision** operating point.
+- Frame buy/wait as binary classifier: positive class = "actual minimum price over next 7d is at least 10% below current price" (the *truth* label).
+- The classifier's score is `wait_score = P(predicted_min_p_quantile < current_price * 0.9)`, derived from the forecast quantile distribution (using the q=0.1 lower-tail estimate as the conservative "drop possible" probability).
+- Sweep the **`wait_score` threshold** (0 → 1); report the precision-recall curve and the **recall at 80% precision** operating point. The 10% drop cutoff is the *positive-class definition* and is held fixed across the sweep.
 
 **Baselines (always reported alongside the model):**
 
@@ -224,12 +220,12 @@ Server-side, managed by `uv`:
 
 ## Deployment (v2 batch scorer)
 
-Built only after Stage 2 passes its gates. New script `scripts/run_batch_scorer.py`, invoked by cron or systemd timer on the server.
+Built only after Stage 1 passes its ship gate. New script `scripts/run_batch_scorer.py`, invoked by cron or systemd timer on the server.
 
 Each run:
 
 1. Pulls all active `(route, departure)` series from `flight_prices` where `departure_datetime > now()` and ≥512h of contiguous history exists.
-2. Runs forecast inference (Stage 2 adapter) for all qualifying series in batched bf16 — single 24GB GPU handles thousands per minute.
+2. Runs forecast inference (Stage 1 adapter) for all qualifying series in batched bf16 — single 24GB GPU handles thousands per minute. If Stage 1.5 has also passed its gate, inference uses `forecast_with_covariates` with `xreg_mode="xreg + timesfm"`; otherwise plain `forecast`.
 3. For each series computes: `predicted_min_p10/p50/p90 over next 168h` (dollar-space), `current_min_price`, derived `wait_score`, and `wait_decision` at the calibrated 80%-precision threshold.
 4. Writes results to a new `flight_predictions` table (`route_id, departure_datetime, scored_at, p10, p50, p90, wait_score, wait_decision`).
 
@@ -244,13 +240,23 @@ The existing `unfare` alert pipeline reads `flight_predictions` to decide whethe
 - No real-time inference API.
 - No per-route or per-cluster LoRA adapters; single global adapter only.
 - No multi-horizon training; 168h only.
+- **No covariate-aware fine-tuning.** TimesFM-2.5's `PatchedTimeSeriesDecoder` (the LoRA target) has no covariate-aware training path; covariates only enter inference via the post-hoc XReg linear regression. v1 uses pure univariate. See "Future work."
 - No retraining automation; manual `make train-*` re-runs are sufficient until a multi-version history exists.
 - No model serving infrastructure (TF Serving, TorchServe, Triton).
 - No changes to scrapers, alert logic, or the `unfare` web app.
 
-## Risks
+## Risks & known constraints
 
+- **TimesFM-2.5 has no covariate-aware fine-tuning.** Verified against (a) the `finetune_lora.py` source on `master` (univariate `(context, target)` only), (b) GitHub issue #257, (c) the `PatchedTimeSeriesDecoder` source which has no covariate forward path, and (d) third-party tutorials confirming covariate support was removed between TimesFM-2.0 and 2.5. The XReg API at inference time uses a per-call sklearn linear fit on the context — it is *not* trained jointly with the model. Implications for our v1: pure univariate LoRA; calendar/seasonality signals come purely from the foundation model's pattern-matching plus the regular hourly cadence in the data.
 - **Forward-fill of short gaps** could mask scraper outages as legitimate price persistence. Mitigated by splitting series at gaps >6h. Watch eval reports for anomalous low-error series — could indicate filled-flat data.
 - **37-route test set** is statistically thin. If gate decisions sit near the threshold, fall back to 5-fold cross-validation on the route split.
 - **TimesFM 2.5 is recent**; APIs may shift. Pin exact versions in `uv.lock` and avoid relying on undocumented internals.
-- **Log-transform interaction with TimesFM's per-window normalization** is layered preprocessing the foundation model wasn't pretrained on. The LoRA should adapt to it, but if Stage 1 fails to beat zero-shot this is the first thing to test (re-run without the log-transform).
+- **Log-transform interaction with TimesFM's internal RevIN normalization** is layered preprocessing the foundation model wasn't pretrained on. The LoRA should adapt to it, but if Stage 1 fails to beat zero-shot this is the first thing to test (re-run without the log-transform).
+
+## Future work (v1.5+)
+
+- **Stage 1.5 XReg overlay** (already specified above) — first thing to evaluate after Stage 1 ships.
+- **Calendar-effect pre-subtraction**: fit a global per-(day_of_week, days_to_departure_bucket) median multiplier; subtract from log-prices before feeding to TimesFM; LoRA learns to forecast residuals; add the calendar effect back at inference. Lets the foundation model focus on dynamics; gives covariate-like benefits without needing TimesFM to ingest covariates. Worth exploring if Stage 1.5 underperforms.
+- **Per-route-cluster LoRAs**: cluster routes by haul length / volatility; train one adapter per cluster. Only worth doing if global LoRA plateaus well below per-route potential.
+- **Multi-horizon training**: add 24h/72h horizons alongside 168h.
+- **Retraining automation** once we have ≥3 successful versions and a clear cadence.
